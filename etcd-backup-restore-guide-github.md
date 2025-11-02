@@ -346,3 +346,208 @@ tail -f /var/log/etcd-backup.log
     লিখে রাখুন
 5.  **মোনিটরিং সেটআপ করুন** - cronjob fail হলে notification পেতে alert
     set করুন
+
+
+
+
+    ঠিক আছে। তুমি চাইছো **Automated Backup Script + CronJob সেটআপ ধাপ বাদ দিয়ে** README.md সংস্করণ।
+আমি তোমার জন্য ফাইলটি সেইভাবে সাজিয়ে দিলাম, শুধু **manual backup এবং restore steps** থাকবে।
+
+---
+
+````markdown
+# 🛠️ etcdctl Download, Backup, and Restore Guide (Manual Backup Only)
+
+এই guide-এ আমরা শেখব কিভাবে **etcdctl ডাউনলোড, manual backup, restore এবং verify** করতে হয় Kubernetes cluster-এর জন্য।  
+
+---
+
+## ধাপ ১: etcdctl ডাউনলোড এবং ইন্সটলেশন
+
+```bash
+# প্রথমে etcd version check করুন
+ETCD_VERSION=$(sudo docker ps | grep etcd | grep -oP 'etcd:\K[0-9.]+' | head -1)
+
+# যদি version না পাওয়া যায়, তাহলে default version use করুন
+ETCD_VERSION=${ETCD_VERSION:-"3.5.0"}
+
+# etcdctl ডাউনলোড করুন
+wget https://github.com/etcd-io/etcd/releases/download/v${ETCD_VERSION}/etcd-v${ETCD_VERSION}-linux-amd64.tar.gz
+
+# ফাইলটি extract করুন
+tar -xvf etcd-v${ETCD_VERSION}-linux-amd64.tar.gz
+
+# etcdctl কে system path-এ move করুন
+sudo mv etcd-v${ETCD_VERSION}-linux-amd64/etcdctl /usr/local/bin/
+sudo chmod +x /usr/local/bin/etcdctl
+
+# Version check করুন
+etcdctl version
+````
+
+---
+
+## ধাপ ২: Environment Variables সেটআপ
+
+```bash
+export ETCDCTL_API=3
+export ETCD_CERT="/etc/kubernetes/pki/etcd/server.crt"
+export ETCD_KEY="/etc/kubernetes/pki/etcd/server.key"
+export ETCD_CACERT="/etc/kubernetes/pki/etcd/ca.crt"
+export ETCD_ENDPOINTS="https://127.0.0.1:2379"
+```
+
+---
+
+## ধাপ ৩: Connection Verify করুন
+
+```bash
+# etcd connection check করুন
+etcdctl --endpoints=$ETCD_ENDPOINTS \
+  --cert=$ETCD_CERT \
+  --key=$ETCD_KEY \
+  --cacert=$ETCD_CACERT \
+  endpoint health
+
+# etcd members list দেখুন
+etcdctl --endpoints=$ETCD_ENDPOINTS \
+  --cert=$ETCD_CERT \
+  --key=$ETCD_KEY \
+  --cacert=$ETCD_CACERT \
+  member list
+```
+
+---
+
+## ধাপ ৪: Manual Backup তৈরি করুন
+
+```bash
+# Backup directory create করুন
+sudo mkdir -p /opt/etcd-backups
+cd /opt/etcd-backups
+
+# Snapshot backup নিন
+etcdctl --endpoints=$ETCD_ENDPOINTS \
+  --cert=$ETCD_CERT \
+  --key=$ETCD_KEY \
+  --cacert=$ETCD_CACERT \
+  snapshot save etcd-snapshot-$(date +%Y-%m-%d-%H-%M-%S).db
+
+# Backup verify করুন
+etcdctl --write-out=table snapshot status etcd-snapshot-*.db
+```
+
+---
+
+## ধাপ ৫: Restore করার প্রস্তুতি
+
+```bash
+# Cluster state check করুন
+kubectl get pods --all-namespaces
+kubectl get nodes
+
+# Latest backup file identify করুন
+BACKUP_FILE=$(ls -t /opt/etcd-backups/etcd-snapshot-*.db | head -1)
+echo "Using backup file: $BACKUP_FILE"
+
+# Backup verify করুন
+etcdctl snapshot status $BACKUP_FILE
+```
+
+---
+
+## ধাপ ৬: Cluster Services বন্ধ করুন
+
+```bash
+sudo systemctl stop kube-apiserver
+sleep 30
+sudo systemctl stop etcd
+sudo systemctl status kube-apiserver
+sudo systemctl status etcd
+```
+
+---
+
+## ধাপ ৭: Current Data Backup নিন
+
+```bash
+sudo tar -czf /opt/etcd-backups/etcd-data-before-restore-$(date +%Y-%m-%d).tar.gz -C /var/lib/etcd .
+sudo mv /var/lib/etcd /var/lib/etcd-old-backup
+```
+
+---
+
+## ধাপ ৮: Restore করুন
+
+```bash
+sudo etcdctl snapshot restore $BACKUP_FILE --data-dir /var/lib/etcd-new
+sudo mv /var/lib/etcd-new /var/lib/etcd
+sudo chown -R etcd:etcd /var/lib/etcd
+# অথবা kubeadm cluster-এর জন্য:
+sudo chown -R 1001:1001 /var/lib/etcd
+```
+
+---
+
+## ধাপ ৯: Services Start করুন
+
+```bash
+sudo systemctl start etcd
+sleep 10
+etcdctl --endpoints=$ETCD_ENDPOINTS \
+  --cert=$ETCD_CERT \
+  --key=$ETCD_KEY \
+  --cacert=$ETCD_CACERT \
+  endpoint health
+
+sudo systemctl start kube-apiserver
+sleep 30
+```
+
+---
+
+## ধাপ ১০: Verify Restoration
+
+```bash
+kubectl cluster-info
+kubectl get nodes
+kubectl get pods --all-namespaces
+
+# Test deployment
+kubectl create deployment test-restore --image=nginx
+kubectl get deployments
+kubectl get pods
+kubectl delete deployment test-restore
+```
+
+---
+
+## ধাপ ১১: Cleanup
+
+```bash
+sudo rm -rf /var/lib/etcd-old-backup
+```
+
+---
+
+## ✅ Important Tips
+
+1. **নিয়মিত ব্যাকআপ নিন** (manual বা automated)
+2. **ব্যাকআপ verify করুন**
+3. **প্রোডাকশন আগে টেস্ট করুন**
+4. **ডকুমেন্টেশন রাখুন**
+5. **Restore process safe environment-এ practice করুন**
+
+---
+
+🎉 এই guide অনুসরণ করে তুমি সহজেই **manual etcd backup এবং restore** করতে পারবে।
+
+```
+
+---
+
+যদি চাও, আমি এই Markdown ফাইল **`manual-etcd-backup-restore.md` নামে download link** হিসেবে তৈরি করে দিতে পারি যাতে তুমি সরাসরি সেভ করতে পারো।  
+
+চাও কি আমি সেটা বানাই?
+```
+
